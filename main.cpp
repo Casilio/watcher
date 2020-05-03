@@ -8,55 +8,64 @@
 
 #define UNUSED(a) a
 
-int fire = 0;
-time_t check_time = 0;
-char current_dir[PATH_MAX];
-char tags_file[PATH_MAX];
+// TODO: Come up with a more meaningful name
+typedef struct Context {
+  int fire;
+  time_t last_fire;
+  char work_dir[PATH_MAX];
+  char tags_file[PATH_MAX];
+} Context;
+
+Context context = {0};
 
 int process_file(const char *fpath, const struct stat *sb, int typeflag) {
   UNUSED(fpath);
   UNUSED(typeflag);
 
-  if (sb->st_mtime > check_time) {
-    if (strcmp(fpath, tags_file) != 0) { 
-      fire = 1;
-      return(1);
+  if (sb->st_mtime > context.last_fire) {
+    if (strcmp(fpath, context.tags_file) != 0) { 
+      printf("Triggered by: %s\n", fpath);
+      context.fire = 1;
+      return 1;
     }
   }
 
-  return(0);
+  return 0;
 }
 
 int main(int argc, char **argv) {
-  getcwd(current_dir, PATH_MAX - 1);
+  getcwd(context.work_dir, PATH_MAX - 1);
 
-  if (!current_dir) {
+  if (!context.work_dir) {
     fprintf(stderr, "Couldn't determine current directory\n");
-    return(1);
+    return 1;
   }
   
-  strcpy(tags_file, current_dir);
-  strcat(tags_file, "/tags");
+  strcpy(context.tags_file, context.work_dir);
+  strcat(context.tags_file, "/tags");
 
   if (argc <= 1) {
     fprintf(stderr, "Command required\n");
-    return(1);
+    return 1;
   }
  
-  check_time = time(0);
-  system(argv[1]);
-  while(1) {
-    ftw(current_dir, process_file, 20);
+  // fire on startup
+  context.fire = 1;
+  context.last_fire = time(0);
 
-    if (fire) {
-      time(&check_time);
+  while(1) {
+    // TODO: inotify ???
+    ftw(context.work_dir, process_file, 20);
+
+    if (context.fire) {
+      time(&context.last_fire);
       system(argv[1]);
-      fire = 0;
+      context.fire = 0;
     }
 
     sleep(1);
   }
 
-  return(0);
+  return 0;
 }
 
