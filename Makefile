@@ -1,11 +1,10 @@
 GCC=clang
-GLAGS=-g
+GFLAGS=-g
 
 src = $(wildcard *.cpp)
-obj = $(src:.cpp=.o)
 
-watcher: $(obj)
-	$(GCC) $(GLAGS) -o $@ $^
+watcher: $(src)
+	$(GCC) $(GFLAGS) -o $@ $^
 
 .PHONY: clean
 clean:
