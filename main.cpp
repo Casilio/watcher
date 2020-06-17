@@ -8,19 +8,11 @@
 #include <poll.h>
 #include <sys/time.h>
 
-typedef struct Filter {
-  ssize_t count;
-  char **filters;
-  int *idx;
-} Filters;
-
-static void handle_events(int fd, char *command);
-static int add_watch(int fd, char const*work_dir);
-static Filters* init_filters();
+#include "main.h"
 
 int main(int argc, char **argv) {
-  char work_dir[PATH_MAX];
-  if (getcwd(work_dir, PATH_MAX - 1) == NULL) {
+  char working_dir[PATH_MAX];
+  if (getcwd(working_dir, PATH_MAX - 1) == NULL) {
     perror("Couldn't determine current directory\n");
     exit(EXIT_FAILURE);
   }
@@ -38,7 +30,7 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  add_watch(inotify_descriptor, work_dir);
+  int fd = add_watch(inotify_descriptor, working_dir);
   
   struct pollfd poll_fd = {.fd = inotify_descriptor, .events = POLLIN};
 
@@ -57,7 +49,6 @@ int main(int argc, char **argv) {
         handle_events(inotify_descriptor, argv[1]);
       }
     }
-
   }
 
   return 0;
@@ -82,10 +73,6 @@ static void handle_events(int fd, char *command) {
 
     for(ptr = buf; ptr < buf + length; ptr += sizeof(struct inotify_event) + event->len) {
       event = (const struct inotify_event*) ptr;
-      // TODO:  Follow up watch descriptors to build a full path
-      // so it will be possible to filter out some files
-      printf("%s\n", event->name); 
-                                    
 
       if (event->mask & IN_ISDIR) {
         if (event->mask & IN_CREATE) { add_watch(fd, event->name); }
@@ -102,9 +89,9 @@ static void handle_events(int fd, char *command) {
   }
 }
 
-static int add_watch(int fd, char const *work_dir) {
-  int watch = inotify_add_watch(fd, work_dir, IN_CREATE | IN_MODIFY | IN_DELETE);
-  if (watch == -1) { fprintf(stderr, "Cannot watch %s.\n", work_dir); }
+static int add_watch(int fd, char const *working_dir) {
+  int watch = inotify_add_watch(fd, working_dir, IN_CREATE | IN_MODIFY | IN_DELETE);
+  if (watch == -1) { fprintf(stderr, "Cannot watch %s.\n", working_dir); }
 
   return watch;
 }
@@ -127,6 +114,7 @@ static Filters* init_filters() {
     if (ch == '\n' && length > 0) {
       buffer[length++] = 0;
 
+      // TODO: Don't you know about possible failures?
       filters = (char**)realloc(filters, (count + 1) * sizeof(char*));
       filters[count] = (char*)malloc(length * sizeof(char));
       memcpy(filters[count], buffer, length);
@@ -138,9 +126,97 @@ static Filters* init_filters() {
     }
   }
 
+  // code above cleaner this way. that's why.
   filter->count = count;
   filter->filters = filters;
 
   return filter;
 }
 
+// IN PROGRESS. DO NOT USE YET
+WdNode *wd_node_create(int fd, char *working_dir) {
+  WdNode *node = (WdNode*)malloc(sizeof(WdNode));
+  node->fd = fd;
+  node->parent = NULL;
+
+  ssize_t clen = strlen(working_dir);
+  node->working_dir = (char*)malloc(sizeof(char) * clen);
+  memcpy(node->working_dir, working_dir, clen);
+
+  node->childs = (WdNode*)malloc(0);
+  node->childs_count = 0;
+
+  return node;
+}
+
+void wd_node_free(WdNode* node) {
+  if (node == NULL) return;
+
+  free(node->childs);
+  free(node->working_dir);
+  free(node);
+}
+
+WdHash *wd_hash_create() {
+  WdHash *hash = (WdHash*)malloc(sizeof(WdHash));
+
+  hash->nodes_count = 10; // default. will exponentially increase
+  hash->nodes = (WdNode*)malloc(sizeof(WdHash*) * hash->nodes_count);
+  memset(hash->nodes, 0, sizeof(WdHash*) * hash->nodes_count); // I wounder if this will be optimized out
+  hash->occupied = 0;
+
+  return hash;
+}
+
+WdNode *wd_hash_get(WdHash* hash, int fd) {
+  int bucket = fd % hash->nodes_count;
+  WdNode *node = &hash->nodes[bucket];
+  if (node && node->fd == fd) return node;
+
+  for (;bucket < hash->nodes_count; bucket++) {
+    node = &hash->nodes[bucket];
+    if (node && node->fd == fd) return node;
+  }
+
+  return NULL;
+}
+
+static void wd_hash_expand(WdHash *hash) {
+    hash->nodes_count *= 2;
+    hash->nodes = (WdNode*)realloc(hash->nodes, sizeof(WdNode*) * hash->nodes_count);
+}
+
+void wd_hash_set(WdHash* hash, WdNode *node) {
+  int bucket = node->fd % hash->nodes_count;
+  int is_free = 0;
+  for (; bucket < hash->nodes_count; bucket++) {
+    if (hash->nodes+bucket == 0) {
+      is_free = 1;
+      break;
+    }
+  }
+
+  if (bucket == hash->nodes_count && !is_free) {
+    // TODO: this might be unnecessary because of the check below
+    wd_hash_expand(hash);
+    bucket++;
+  }
+
+  hash->nodes[bucket] = *node;
+  hash->occupied++;
+
+  if (hash->occupied / hash->nodes_count > 0.75) {
+    wd_hash_expand(hash);
+  }
+}
+
+void wd_hash_del(WdHash* hash, int fd) {
+  WdNode *node = wd_hash_get(hash, fd);
+  if (node == NULL) return;
+
+  for (int i = 0; i < node->childs_count; i++) {
+    wd_hash_del(hash, node->childs[i].fd);
+  }
+
+  wd_node_free(node);
+}
