@@ -8,8 +8,15 @@
 #include <poll.h>
 #include <sys/time.h>
 
+typedef struct Filter {
+  ssize_t count;
+  char **filters;
+  int *idx;
+} Filters;
+
 static void handle_events(int fd, char *command);
 static int add_watch(int fd, char const*work_dir);
+static Filters* init_filters();
 
 int main(int argc, char **argv) {
   char work_dir[PATH_MAX];
@@ -22,6 +29,8 @@ int main(int argc, char **argv) {
     perror("Command required\n");
     exit(EXIT_FAILURE);
   }
+
+  Filter *filter = init_filters();
 
   int inotify_descriptor = inotify_init1(IN_NONBLOCK);
   if (inotify_descriptor == -1) {
@@ -61,9 +70,7 @@ static void handle_events(int fd, char *command) {
   char *ptr;
 
   int fire = 0;
-
   while(1) {
-
     length = read(fd, buf, sizeof(buf));
 
     if (length == -1 && errno != EAGAIN) {
@@ -71,14 +78,19 @@ static void handle_events(int fd, char *command) {
       exit(EXIT_FAILURE);
     }
 
-    if (length == 0) break;
+    if (length == 0) return;
 
     for(ptr = buf; ptr < buf + length; ptr += sizeof(struct inotify_event) + event->len) {
       event = (const struct inotify_event*) ptr;
+      // TODO:  Follow up watch descriptors to build a full path
+      // so it will be possible to filter out some files
+      printf("%s\n", event->name); 
+                                    
+
       if (event->mask & IN_ISDIR) {
         if (event->mask & IN_CREATE) { add_watch(fd, event->name); }
       } else {
-      // if (event->len) printf("%s\n", event->name); TODO: handle exceptions
+        // if (event->len) printf("%s\n", event->name); TODO: handle exceptions
         fire = 1;
       }
     }
@@ -96,3 +108,39 @@ static int add_watch(int fd, char const *work_dir) {
 
   return watch;
 }
+
+static Filters* init_filters() {
+  FILE *gitignore = fopen(".gitignore", "r");
+  if (gitignore == NULL) {
+    return NULL;
+  }
+
+  Filter *filter = (Filters*)malloc(sizeof(Filter));
+  size_t count = 0;
+  char **filters = (char**)malloc(0);
+
+  char buffer[4096]; // unlikely long filter line; TODO: check boundaries in the loop
+  size_t length = 0;
+  char ch;
+
+  while ((ch = fgetc(gitignore)) != EOF) {
+    if (ch == '\n' && length > 0) {
+      buffer[length++] = 0;
+
+      filters = (char**)realloc(filters, (count + 1) * sizeof(char*));
+      filters[count] = (char*)malloc(length * sizeof(char));
+      memcpy(filters[count], buffer, length);
+      count++;
+
+      length = 0;
+    } else {
+      buffer[length++] = ch;
+    }
+  }
+
+  filter->count = count;
+  filter->filters = filters;
+
+  return filter;
+}
+
