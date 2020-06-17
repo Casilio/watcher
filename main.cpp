@@ -30,9 +30,11 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  int fd = add_watch(inotify_descriptor, working_dir);
-  
-  struct pollfd poll_fd = {.fd = inotify_descriptor, .events = POLLIN};
+  add_watch(inotify_descriptor, working_dir);
+
+  pollfd poll_fd = {.fd = inotify_descriptor, .events = POLLIN};
+
+  WdHash *hash = wd_hash_create();
 
   int polls_count;
   while(1) {
@@ -46,7 +48,7 @@ int main(int argc, char **argv) {
 
     if (polls_count > 0) {
       if (poll_fd.revents & POLLIN) {
-        handle_events(inotify_descriptor, argv[1]);
+        handle_events(inotify_descriptor, argv[1], hash);
       }
     }
   }
@@ -54,38 +56,60 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-static void handle_events(int fd, char *command) {
+static void handle_events(int fd, char *command, WdHash *hash) {
   char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
   const struct inotify_event *event;
   ssize_t length;
   char *ptr;
 
   int fire = 0;
-  while(1) {
-    length = read(fd, buf, sizeof(buf));
+  length = read(fd, buf, sizeof(buf));
 
-    if (length == -1 && errno != EAGAIN) {
-      perror("read");
-      exit(EXIT_FAILURE);
-    }
+  if (length == -1 && errno != EAGAIN) {
+    perror("read");
+    exit(EXIT_FAILURE);
+  }
 
-    if (length == 0) return;
+  if (length == 0) return;
 
-    for(ptr = buf; ptr < buf + length; ptr += sizeof(struct inotify_event) + event->len) {
-      event = (const struct inotify_event*) ptr;
+  for(ptr = buf; ptr < buf + length; ptr += sizeof(struct inotify_event) + event->len) {
+    event = (const struct inotify_event*) ptr;
 
-      if (event->mask & IN_ISDIR) {
-        if (event->mask & IN_CREATE) { add_watch(fd, event->name); }
-      } else {
-        // if (event->len) printf("%s\n", event->name); TODO: handle exceptions
-        fire = 1;
+    if (event->mask & IN_ISDIR) {
+      if (event->mask & IN_CREATE) {
+        // TODO: Can't do this. Fails for inner folders. Need to build a full path first.
+        int new_wd = add_watch(fd, event->name);
+        WdNode *parent = wd_hash_get(hash, event->wd);
+        WdNode *new_node = wd_node_create(new_wd, (char*)event->name);
+        if (parent != NULL) {
+          new_node->parent = parent;
+          wd_node_add_child(parent, new_node);
+        }
+
+        wd_hash_set(hash, new_node);
       }
-    }
+      if (event->mask & IN_DELETE) { fire = 1; }
 
-    if (fire) {
-      system(command);
-      fire = 0;
+    } else {
+      WdNode *node = wd_hash_get(hash, event->wd);
+
+#if 0
+      if (node) {
+        printf("%s", node->working_dir);
+        if (node->parent) {
+          printf("/%s/", node->parent->working_dir);
+        }
+      }
+      printf("%s\n", event->name);
+#endif
+      // if (event->len) printf("%s\n", event->name); TODO: handle exceptions
+      fire = 1;
     }
+  }
+
+  if (fire) {
+    system(command);
+    fire = 0;
   }
 }
 
@@ -143,7 +167,7 @@ WdNode *wd_node_create(int fd, char *working_dir) {
   node->working_dir = (char*)malloc(sizeof(char) * clen);
   memcpy(node->working_dir, working_dir, clen);
 
-  node->childs = (WdNode*)malloc(0);
+  node->childs = (WdNode**)malloc(0);
   node->childs_count = 0;
 
   return node;
@@ -157,11 +181,17 @@ void wd_node_free(WdNode* node) {
   free(node);
 }
 
+void wd_node_add_child(WdNode *parent, WdNode *child) {
+  parent->childs_count++;
+  parent->childs = (WdNode**)realloc(parent->childs, parent->childs_count * sizeof(WdNode*));
+  parent->childs[parent->childs_count] = child;
+}
+
 WdHash *wd_hash_create() {
   WdHash *hash = (WdHash*)malloc(sizeof(WdHash));
 
   hash->nodes_count = 10; // default. will exponentially increase
-  hash->nodes = (WdNode*)malloc(sizeof(WdHash*) * hash->nodes_count);
+  hash->nodes = (WdNode**)malloc(sizeof(WdHash*) * hash->nodes_count);
   memset(hash->nodes, 0, sizeof(WdHash*) * hash->nodes_count); // I wounder if this will be optimized out
   hash->occupied = 0;
 
@@ -170,11 +200,11 @@ WdHash *wd_hash_create() {
 
 WdNode *wd_hash_get(WdHash* hash, int fd) {
   int bucket = fd % hash->nodes_count;
-  WdNode *node = &hash->nodes[bucket];
+  WdNode *node = hash->nodes[bucket];
   if (node && node->fd == fd) return node;
 
   for (;bucket < hash->nodes_count; bucket++) {
-    node = &hash->nodes[bucket];
+    node = hash->nodes[bucket];
     if (node && node->fd == fd) return node;
   }
 
@@ -183,14 +213,14 @@ WdNode *wd_hash_get(WdHash* hash, int fd) {
 
 static void wd_hash_expand(WdHash *hash) {
     hash->nodes_count *= 2;
-    hash->nodes = (WdNode*)realloc(hash->nodes, sizeof(WdNode*) * hash->nodes_count);
+    hash->nodes = (WdNode**)realloc(hash->nodes, sizeof(WdNode*) * hash->nodes_count);
 }
 
 void wd_hash_set(WdHash* hash, WdNode *node) {
   int bucket = node->fd % hash->nodes_count;
   int is_free = 0;
   for (; bucket < hash->nodes_count; bucket++) {
-    if (hash->nodes+bucket == 0) {
+    if (&hash->nodes[bucket] == NULL) {
       is_free = 1;
       break;
     }
@@ -202,7 +232,7 @@ void wd_hash_set(WdHash* hash, WdNode *node) {
     bucket++;
   }
 
-  hash->nodes[bucket] = *node;
+  hash->nodes[bucket] = node;
   hash->occupied++;
 
   if (hash->occupied / hash->nodes_count > 0.75) {
@@ -215,7 +245,7 @@ void wd_hash_del(WdHash* hash, int fd) {
   if (node == NULL) return;
 
   for (int i = 0; i < node->childs_count; i++) {
-    wd_hash_del(hash, node->childs[i].fd);
+    wd_hash_del(hash, node->childs[i]->fd);
   }
 
   wd_node_free(node);
