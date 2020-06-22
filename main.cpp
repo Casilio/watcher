@@ -7,6 +7,7 @@
 #include <sys/inotify.h>
 #include <poll.h>
 #include <sys/time.h>
+#include <fnmatch.h>
 
 #include "main.h"
 
@@ -48,7 +49,7 @@ int main(int argc, char **argv) {
 
     if (polls_count > 0) {
       if (poll_fd.revents & POLLIN) {
-        handle_events(inotify_descriptor, argv[1], hash);
+        handle_events(inotify_descriptor, argv[1], hash, filter);
       }
     }
   }
@@ -56,11 +57,12 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-static void handle_events(int fd, char *command, WdHash *hash) {
+static void handle_events(int fd, char *command, WdHash *hash, Filter* filter) {
   char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
   const struct inotify_event *event;
   ssize_t length;
   char *ptr;
+  char buffer[PATH_MAX];
 
   int fire = 0;
   length = read(fd, buf, sizeof(buf));
@@ -74,12 +76,16 @@ static void handle_events(int fd, char *command, WdHash *hash) {
 
   for(ptr = buf; ptr < buf + length; ptr += sizeof(struct inotify_event) + event->len) {
     event = (const struct inotify_event*) ptr;
+    memset(buffer, 0, PATH_MAX * sizeof(char));
 
     if (event->mask & IN_ISDIR) {
       if (event->mask & IN_CREATE) {
-        // TODO: Can't do this. Fails for inner folders. Need to build a full path first.
-        int new_wd = add_watch(fd, event->name);
         WdNode *parent = wd_hash_get(hash, event->wd);
+
+        if (parent) { fullpath(parent, buffer); }
+        snprintf(buffer + strlen(buffer), PATH_MAX, "%s", event->name);
+
+        int new_wd = add_watch(fd, buffer);
         WdNode *new_node = wd_node_create(new_wd, (char*)event->name);
         if (parent != NULL) {
           new_node->parent = parent;
@@ -93,17 +99,20 @@ static void handle_events(int fd, char *command, WdHash *hash) {
     } else {
       WdNode *node = wd_hash_get(hash, event->wd);
 
-#if 0
-      if (node) {
-        printf("%s", node->working_dir);
-        if (node->parent) {
-          printf("/%s/", node->parent->working_dir);
+      if (node) { fullpath(node, buffer); }
+      snprintf(buffer + strlen(buffer), PATH_MAX, "%s", event->name);
+
+      int matched = 0;
+      for (int i = 0; i < filter->count; i++) {
+        if (fnmatch(filter->filters[i], buffer, 0) == 0) {
+          matched = 1;
+          break;
         }
       }
-      printf("%s\n", event->name);
-#endif
-      // if (event->len) printf("%s\n", event->name); TODO: handle exceptions
-      fire = 1;
+
+      if (!matched) {
+        fire = 1;
+      }
     }
   }
 
@@ -250,3 +259,13 @@ void wd_hash_del(WdHash* hash, int fd) {
 
   wd_node_free(node);
 }
+
+static char *fullpath(WdNode *node, char *buffer) {
+  if (node->parent) {
+    fullpath(node->parent, buffer);
+  }
+  sprintf(buffer + strlen(buffer), "%s/", node->working_dir);
+
+  return buffer;
+}
+

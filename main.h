@@ -40,9 +40,10 @@ typedef struct Filter {
   int *idx;
 } Filters;
 
-static void handle_events(int fd, char *command, WdHash *);
+static void handle_events(int fd, char *command, WdHash *, Filter*);
 static int add_watch(int fd, char const*working_dir);
 static Filters* init_filters();
+static char *fullpath(WdNode *node, char *buffer);
 
 #endif
 
