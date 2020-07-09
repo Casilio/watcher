@@ -8,53 +8,85 @@
 #include <poll.h>
 #include <sys/time.h>
 #include <fnmatch.h>
+#include <sys/types.h>
+#include <dirent.h>
 
 #include "main.h"
 
-int main(int argc, char **argv) {
-  char working_dir[PATH_MAX];
-  if (getcwd(working_dir, PATH_MAX - 1) == NULL) {
-    perror("Couldn't determine current directory\n");
+char *ignore_dirs[] = {
+  (char*)".",
+  (char*)"..",
+  (char*)".git"
+};
+
+static int add_watch(int fd, char const *working_dir) {
+  int watch = inotify_add_watch(fd, working_dir, IN_CREATE | IN_MODIFY | IN_DELETE);
+  if (watch == -1) { fprintf(stderr, "Cannot watch %s: %s.\n", working_dir, strerror(errno)); }
+
+  return watch;
+}
+
+static char *fullpath(WdNode *node, char *buffer) {
+  if (node->parent) {
+    fullpath(node->parent, buffer);
+  }
+  sprintf(buffer + strlen(buffer), "%s/", node->working_dir);
+
+  return buffer;
+}
+
+static int watch_dir(WdHash *hash, int ifd, int parent_wd, char *dirname) {
+  char buffer[PATH_MAX];
+  memset(buffer, 0, PATH_MAX * sizeof(char));
+
+  WdNode *parent = wd_hash_get(hash, parent_wd);
+
+  if (parent) { fullpath(parent, buffer); }
+  snprintf(buffer + strlen(buffer), PATH_MAX, "%s", dirname);
+
+  int new_wd = add_watch(ifd, buffer);
+  if (new_wd == -1) return -1;
+
+  WdNode *new_node = wd_node_create(new_wd, dirname);
+  if (parent != NULL) {
+    new_node->parent = parent;
+    wd_node_add_child(parent, new_node);
+  }
+
+  wd_hash_set(hash, new_node);
+
+  return new_wd;
+}
+
+static void add_watch_recursively(WdHash *hash, char* dir_name, int ifd, int parent_wd) {
+  DIR *dir = opendir(dir_name);
+
+  if (errno) {
+    perror(strerror(errno));
     exit(EXIT_FAILURE);
   }
-  
-  if (argc <= 1) {
-    perror("Command required\n");
-    exit(EXIT_FAILURE);
-  }
+  chdir(dir_name);
 
-  Filter *filter = init_filters();
+  int wd = watch_dir(hash, ifd, parent_wd, dir_name);
+  if (wd == -1) goto error;
 
-  int inotify_descriptor = inotify_init1(IN_NONBLOCK);
-  if (inotify_descriptor == -1) {
-    perror("Inotify init failed. Exiting");
-    exit(EXIT_FAILURE);
-  }
-
-  add_watch(inotify_descriptor, working_dir);
-
-  pollfd poll_fd = {.fd = inotify_descriptor, .events = POLLIN};
-
-  WdHash *hash = wd_hash_create();
-
-  int polls_count;
-  while(1) {
-    polls_count = poll(&poll_fd, 1, -1);
-
-    if (polls_count < 0) {
-      if (errno == EINTR) continue;
-      perror("Poll");
-      exit(EXIT_FAILURE);
+  while (dirent *child = readdir(dir)) {
+    int i = 0, skip = 0;
+    while (ignore_dirs[i]) {
+      if (strcmp(child->d_name, ignore_dirs[i]) == 0) skip = 1;
+      i++;
     }
 
-    if (polls_count > 0) {
-      if (poll_fd.revents & POLLIN) {
-        handle_events(inotify_descriptor, argv[1], hash, filter);
-      }
+    if (skip) continue;
+
+    if (child->d_type == DT_DIR) {
+      add_watch_recursively(hash, child->d_name, ifd, wd);
     }
   }
 
-  return 0;
+error:
+  chdir("..");
+  closedir(dir);
 }
 
 static void handle_events(int fd, char *command, WdHash *hash, Filter* filter) {
@@ -80,19 +112,7 @@ static void handle_events(int fd, char *command, WdHash *hash, Filter* filter) {
 
     if (event->mask & IN_ISDIR) {
       if (event->mask & IN_CREATE) {
-        WdNode *parent = wd_hash_get(hash, event->wd);
-
-        if (parent) { fullpath(parent, buffer); }
-        snprintf(buffer + strlen(buffer), PATH_MAX, "%s", event->name);
-
-        int new_wd = add_watch(fd, buffer);
-        WdNode *new_node = wd_node_create(new_wd, (char*)event->name);
-        if (parent != NULL) {
-          new_node->parent = parent;
-          wd_node_add_child(parent, new_node);
-        }
-
-        wd_hash_set(hash, new_node);
+        watch_dir(hash, fd, event->wd, (char*)event->name);
       }
       if (event->mask & IN_DELETE) { fire = 1; }
 
@@ -120,13 +140,6 @@ static void handle_events(int fd, char *command, WdHash *hash, Filter* filter) {
     system(command);
     fire = 0;
   }
-}
-
-static int add_watch(int fd, char const *working_dir) {
-  int watch = inotify_add_watch(fd, working_dir, IN_CREATE | IN_MODIFY | IN_DELETE);
-  if (watch == -1) { fprintf(stderr, "Cannot watch %s.\n", working_dir); }
-
-  return watch;
 }
 
 static Filters* init_filters() {
@@ -159,22 +172,68 @@ static Filters* init_filters() {
     }
   }
 
-  // code above cleaner this way. that's why.
   filter->count = count;
   filter->filters = filters;
 
   return filter;
 }
 
-// IN PROGRESS. DO NOT USE YET
+int main(int argc, char **argv) {
+  char working_dir[PATH_MAX];
+  if (getcwd(working_dir, PATH_MAX - 1) == NULL) {
+    perror("Couldn't determine current directory\n");
+    exit(EXIT_FAILURE);
+  }
+
+  if (argc <= 1) {
+    perror("Command required\n");
+    exit(EXIT_FAILURE);
+  }
+
+  Filter *filter = init_filters();
+
+  int inotify_descriptor = inotify_init1(IN_NONBLOCK);
+  if (inotify_descriptor == -1) {
+    perror("Inotify init failed. Exiting");
+    exit(EXIT_FAILURE);
+  }
+
+  pollfd poll_fd = {.fd = inotify_descriptor, .events = POLLIN};
+
+  WdHash *hash = wd_hash_create();
+
+  add_watch_recursively(hash, working_dir, inotify_descriptor, 0);
+
+  printf("Looking at you, %s\n", working_dir);
+  int polls_count;
+  while(1) {
+    polls_count = poll(&poll_fd, 1, -1);
+
+    if (polls_count < 0) {
+      if (errno == EINTR) continue;
+      perror("Poll");
+      exit(EXIT_FAILURE);
+    }
+
+    if (polls_count > 0) {
+      if (poll_fd.revents & POLLIN) {
+        handle_events(inotify_descriptor, argv[1], hash, filter);
+      }
+    }
+  }
+
+  return 0;
+}
+
 WdNode *wd_node_create(int fd, char *working_dir) {
   WdNode *node = (WdNode*)malloc(sizeof(WdNode));
   node->fd = fd;
   node->parent = NULL;
 
-  ssize_t clen = strlen(working_dir);
+  ssize_t clen = strlen(working_dir) + 1;
   node->working_dir = (char*)malloc(sizeof(char) * clen);
   memcpy(node->working_dir, working_dir, clen);
+  node->working_dir[clen] = 0;
 
   node->childs = (WdNode**)malloc(0);
   node->childs_count = 0;
@@ -207,14 +266,13 @@ WdHash *wd_hash_create() {
   return hash;
 }
 
-WdNode *wd_hash_get(WdHash* hash, int fd) {
-  int bucket = fd % hash->nodes_count;
-  WdNode *node = hash->nodes[bucket];
-  if (node && node->fd == fd) return node;
+WdNode *wd_hash_get(WdHash* hash, int wd) {
+  int bucket = wd % hash->nodes_count;
+  WdNode *node;
 
   for (;bucket < hash->nodes_count; bucket++) {
     node = hash->nodes[bucket];
-    if (node && node->fd == fd) return node;
+    if (node && node->fd == wd) return node;
   }
 
   return NULL;
@@ -227,16 +285,15 @@ static void wd_hash_expand(WdHash *hash) {
 
 void wd_hash_set(WdHash* hash, WdNode *node) {
   int bucket = node->fd % hash->nodes_count;
-  int is_free = 0;
+  int free_bucket_exists = 0;
   for (; bucket < hash->nodes_count; bucket++) {
-    if (&hash->nodes[bucket] == NULL) {
-      is_free = 1;
+    if (hash->nodes[bucket] == NULL || hash->nodes[bucket]->fd == node->fd) {
+      free_bucket_exists = 1;
       break;
     }
   }
 
-  if (bucket == hash->nodes_count && !is_free) {
-    // TODO: this might be unnecessary because of the check below
+  if (bucket == hash->nodes_count && !free_bucket_exists) {
     wd_hash_expand(hash);
     bucket++;
   }
@@ -258,14 +315,5 @@ void wd_hash_del(WdHash* hash, int fd) {
   }
 
   wd_node_free(node);
-}
-
-static char *fullpath(WdNode *node, char *buffer) {
-  if (node->parent) {
-    fullpath(node->parent, buffer);
-  }
-  sprintf(buffer + strlen(buffer), "%s/", node->working_dir);
-
-  return buffer;
 }
 
