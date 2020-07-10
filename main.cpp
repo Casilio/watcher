@@ -203,6 +203,7 @@ int main(int argc, char **argv) {
   WdHash *hash = wd_hash_create();
 
   add_watch_recursively(hash, working_dir, inotify_descriptor, 0);
+  chdir(working_dir);
 
   printf("Looking at you, %s\n", working_dir);
   int polls_count;
